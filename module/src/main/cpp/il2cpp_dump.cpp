@@ -98,21 +98,21 @@ static void patch_dump_metadata_and_libil2cpp(const char *outDir) {
 
             uintptr_t r_start = 0, r_end = 0;
             if (!patch_find_region(name_ptr, &r_start, &r_end)) {
-                LOGI("[PATCH]   image[%zu] '%s' ptr=0x%lx -> no region", a, name, name_ptr);
+                LOGI("[PATCH]   image[%zu] '%s' ptr=0x%" PRIxPTR " -> no region", a, name, name_ptr);
                 continue;
             }
-            LOGI("[PATCH]   image[%zu] '%s' ptr=0x%lx in region 0x%lx-0x%lx (size=%zu)",
+            LOGI("[PATCH]   image[%zu] '%s' ptr=0x%" PRIxPTR " in region 0x%" PRIxPTR "-0x%" PRIxPTR " (size=%zu)",
                  a, name, name_ptr, r_start, r_end, (size_t)(r_end - r_start));
 
             // Walk backward from name_ptr (aligned down to 4 bytes) to r_start, stepping
             // 4 bytes at a time, looking for the IL2CPP magic.
-            uintptr_t scan_from = name_ptr & ~3ULL;
+            uintptr_t scan_from = name_ptr & ~(uintptr_t)3;
             for (uintptr_t p = scan_from; p >= r_start; p -= 4) {
                 if (*reinterpret_cast<const uint32_t *>(p) == MAGIC) {
-                    size_t dump_size = r_end - p;
-                    LOGI("[PATCH] METADATA FOUND at 0x%lx (image name at 0x%lx, offset 0x%lx, dump_size=%zu)",
-                         p, name_ptr, name_ptr - p, dump_size);
-                    metadata_dumped = patch_dump_region_direct(p, dump_size, outPath);
+                    size_t dump_size = (size_t)(r_end - p);
+                    LOGI("[PATCH] METADATA FOUND at 0x%" PRIxPTR " (image name at 0x%" PRIxPTR ", offset 0x%" PRIxPTR ", dump_size=%zu)",
+                         p, name_ptr, (uintptr_t)(name_ptr - p), dump_size);
+                    metadata_dumped = patch_dump_region_direct((uint64_t)p, dump_size, outPath);
                     break;
                 }
                 if (p < 4) break;
