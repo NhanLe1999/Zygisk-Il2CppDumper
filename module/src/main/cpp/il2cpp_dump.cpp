@@ -52,64 +52,122 @@ static bool patch_dump_region_direct(uint64_t start, size_t size, const std::str
     return written == size;
 }
 
-static void patch_dump_metadata_and_libil2cpp(const char *outDir) {
-    LOGI("[PATCH] scanning /proc/self/maps for IL2CPP metadata buffer");
-    const uint32_t MAGIC = 0xFAB11BAFu;
-
-    // SAFETY: only scan regions we know are safe to dereference:
-    //   - anonymous (empty path)
-    //   - [heap]
-    //   - [anon:*]
-    //   - /memfd:* (in-memory file)
-    //   - /dev/ashmem/* (legacy Android shared memory)
-    // File-backed regions (.so/.apk/.dex/etc.) are SKIPPED — they can SIGBUS
-    // if read past end-of-file via Houdini translation.
-    FILE *maps_f = fopen("/proc/self/maps", "r");
-    bool metadata_dumped = false;
-    int regions_checked = 0;
-    int regions_seen = 0;
-    if (maps_f) {
-        char line[2048];
-        while (fgets(line, sizeof(line), maps_f) && !metadata_dumped) {
-            unsigned long start = 0, end = 0;
-            char perms[8] = {0};
-            char path_part[1024] = {0};
-            int n = sscanf(line, "%lx-%lx %7s %*s %*s %*s %1023[^\n]",
-                           &start, &end, perms, path_part);
-            if (n < 3) continue;
-            regions_seen++;
-            if (perms[0] != 'r') continue;
-            size_t size = end - start;
-            if (size < 64 * 1024 || size > 100 * 1024 * 1024) continue;
-
-            // WHITELIST only known-safe region types
-            bool is_anon       = (path_part[0] == '\0');
-            bool is_heap       = (strcmp(path_part, "[heap]") == 0);
-            bool is_anon_label = (strncmp(path_part, "[anon:", 6) == 0);
-            bool is_memfd      = (strncmp(path_part, "/memfd:", 7) == 0);
-            bool is_ashmem     = (strncmp(path_part, "/dev/ashmem/", 12) == 0);
-            if (!is_anon && !is_heap && !is_anon_label && !is_memfd && !is_ashmem) continue;
-
-            // Scan first 64KB for magic at any 4-byte aligned offset.
-            const uint32_t *p = reinterpret_cast<const uint32_t *>(start);
-            size_t scan_words = (size < 65536 ? size : 65536) / 4;
-            size_t found_offset = (size_t)-1;
-            for (size_t i = 0; i < scan_words; ++i) {
-                if (p[i] == MAGIC) { found_offset = i * 4; break; }
-            }
-            regions_checked++;
-            if (found_offset == (size_t)-1) continue;
-
-            unsigned long magic_addr = start + found_offset;
-            size_t dump_size = size - found_offset;
-            LOGI("[PATCH] METADATA FOUND at 0x%lx (region 0x%lx-0x%lx, offset 0x%zx, dump_size=%zu) path=[%s]",
-                 magic_addr, start, end, found_offset, dump_size, path_part);
-            std::string outPath = std::string(outDir) + "/files/global-metadata.dat";
-            metadata_dumped = patch_dump_region_direct(magic_addr, dump_size, outPath);
+// Find the region in /proc/self/maps that contains `addr`. Sets *out_start/*out_end.
+static bool patch_find_region(uintptr_t addr, uintptr_t *out_start, uintptr_t *out_end) {
+    FILE *m = fopen("/proc/self/maps", "r");
+    if (!m) return false;
+    char line[2048];
+    bool found = false;
+    while (fgets(line, sizeof(line), m)) {
+        unsigned long s = 0, e = 0;
+        if (sscanf(line, "%lx-%lx", &s, &e) != 2) continue;
+        if (addr >= s && addr < e) {
+            *out_start = s;
+            *out_end = e;
+            found = true;
+            break;
         }
-        fclose(maps_f);
     }
-    LOGI("[PATCH] saw %d total regions, scanned %d candidate regions", regions_seen, regions_checked);
+    fclose(m);
+    return found;
+}
+
+static void patch_dump_metadata_and_libil2cpp(const char *outDir) {
+    const uint32_t MAGIC = 0xFAB11BAFu;
+    bool metadata_dumped = false;
+    std::string outPath = std::string(outDir) + "/files/global-metadata.dat";
+
+    // STRATEGY A (preferred): use IL2CPP API to get a pointer INTO the metadata
+    // string table (via image name), then scan BACKWARD page-by-page from that
+    // pointer to find the magic bytes at the start of the metadata buffer.
+    LOGI("[PATCH] Strategy A: locate metadata via il2cpp_image_get_name");
+    if (il2cpp_domain_get && il2cpp_domain_get_assemblies &&
+        il2cpp_assembly_get_image && il2cpp_image_get_name) {
+        auto domain = il2cpp_domain_get();
+        size_t asm_count = 0;
+        const Il2CppAssembly **assemblies =
+            il2cpp_domain_get_assemblies(domain, &asm_count);
+        LOGI("[PATCH] domain=%p assemblies=%p count=%zu", domain, assemblies, asm_count);
+
+        for (size_t a = 0; a < asm_count && !metadata_dumped; ++a) {
+            const Il2CppImage *image = il2cpp_assembly_get_image(assemblies[a]);
+            if (!image) continue;
+            const char *name = il2cpp_image_get_name(image);
+            if (!name) continue;
+            uintptr_t name_ptr = reinterpret_cast<uintptr_t>(name);
+
+            uintptr_t r_start = 0, r_end = 0;
+            if (!patch_find_region(name_ptr, &r_start, &r_end)) {
+                LOGI("[PATCH]   image[%zu] '%s' ptr=0x%lx -> no region", a, name, name_ptr);
+                continue;
+            }
+            LOGI("[PATCH]   image[%zu] '%s' ptr=0x%lx in region 0x%lx-0x%lx (size=%zu)",
+                 a, name, name_ptr, r_start, r_end, (size_t)(r_end - r_start));
+
+            // Walk backward from name_ptr (aligned down to 4 bytes) to r_start, stepping
+            // 4 bytes at a time, looking for the IL2CPP magic.
+            uintptr_t scan_from = name_ptr & ~3ULL;
+            for (uintptr_t p = scan_from; p >= r_start; p -= 4) {
+                if (*reinterpret_cast<const uint32_t *>(p) == MAGIC) {
+                    size_t dump_size = r_end - p;
+                    LOGI("[PATCH] METADATA FOUND at 0x%lx (image name at 0x%lx, offset 0x%lx, dump_size=%zu)",
+                         p, name_ptr, name_ptr - p, dump_size);
+                    metadata_dumped = patch_dump_region_direct(p, dump_size, outPath);
+                    break;
+                }
+                if (p < 4) break;
+            }
+        }
+    } else {
+        LOGE("[PATCH] Strategy A unavailable: missing IL2CPP APIs");
+    }
+
+    // STRATEGY B (fallback): brute-force scan all safe anonymous regions.
+    if (!metadata_dumped) {
+        LOGI("[PATCH] Strategy B: brute-force scan of anonymous regions");
+        FILE *maps_f = fopen("/proc/self/maps", "r");
+        int regions_seen = 0, regions_checked = 0;
+        if (maps_f) {
+            char line[2048];
+            while (fgets(line, sizeof(line), maps_f) && !metadata_dumped) {
+                unsigned long start = 0, end = 0;
+                char perms[8] = {0};
+                char path_part[1024] = {0};
+                int n = sscanf(line, "%lx-%lx %7s %*s %*s %*s %1023[^\n]",
+                               &start, &end, perms, path_part);
+                if (n < 3) continue;
+                regions_seen++;
+                if (perms[0] != 'r') continue;
+                size_t size = end - start;
+                if (size < 64 * 1024 || size > 100 * 1024 * 1024) continue;
+                bool is_anon       = (path_part[0] == '\0');
+                bool is_heap       = (strcmp(path_part, "[heap]") == 0);
+                bool is_anon_label = (strncmp(path_part, "[anon:", 6) == 0);
+                bool is_memfd      = (strncmp(path_part, "/memfd:", 7) == 0);
+                bool is_ashmem     = (strncmp(path_part, "/dev/ashmem/", 12) == 0);
+                if (!is_anon && !is_heap && !is_anon_label && !is_memfd && !is_ashmem) continue;
+
+                // Scan WHOLE region (not just first 64KB).
+                const uint32_t *p = reinterpret_cast<const uint32_t *>(start);
+                size_t scan_words = size / 4;
+                size_t found_offset = (size_t)-1;
+                for (size_t i = 0; i < scan_words; ++i) {
+                    if (p[i] == MAGIC) { found_offset = i * 4; break; }
+                }
+                regions_checked++;
+                if (found_offset == (size_t)-1) continue;
+
+                unsigned long magic_addr = start + found_offset;
+                size_t dump_size = size - found_offset;
+                LOGI("[PATCH] METADATA FOUND via brute scan at 0x%lx (region 0x%lx-0x%lx, offset 0x%zx) path=[%s]",
+                     magic_addr, start, end, found_offset, path_part);
+                metadata_dumped = patch_dump_region_direct(magic_addr, dump_size, outPath);
+            }
+            fclose(maps_f);
+        }
+        LOGI("[PATCH] Strategy B: saw %d total, scanned %d", regions_seen, regions_checked);
+    }
+
     if (!metadata_dumped) {
         LOGE("[PATCH] metadata buffer NOT found in memory");
     }
