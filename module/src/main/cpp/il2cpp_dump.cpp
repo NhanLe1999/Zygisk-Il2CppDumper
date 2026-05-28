@@ -5,6 +5,8 @@
 #include "il2cpp_dump.h"
 #include <dlfcn.h>
 #include <cstdlib>
+#include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <cinttypes>
 #include <string>
@@ -12,6 +14,8 @@
 #include <sstream>
 #include <fstream>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
@@ -24,6 +28,105 @@
 #undef DO_API
 
 static uint64_t il2cpp_base = 0;
+
+// ===== PATCH: dump raw decrypted global-metadata.dat + in-memory libil2cpp.so =====
+static bool patch_read_proc_mem(FILE *mem, uint64_t addr, void *buf, size_t len) {
+    if (fseeko(mem, (off_t)addr, SEEK_SET) != 0) return false;
+    return fread(buf, 1, len, mem) == len;
+}
+
+static bool patch_dump_region_via_proc_mem(FILE *mem_f, uint64_t start, size_t size,
+                                            const std::string &outPath) {
+    FILE *out = fopen(outPath.c_str(), "wb");
+    if (!out) { LOGE("[PATCH] cannot open output %s", outPath.c_str()); return false; }
+    char buf[65536];
+    size_t remaining = size;
+    if (fseeko(mem_f, (off_t)start, SEEK_SET) != 0) { fclose(out); return false; }
+    while (remaining > 0) {
+        size_t to_read = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+        size_t got = fread(buf, 1, to_read, mem_f);
+        if (got == 0) break;
+        fwrite(buf, 1, got, out);
+        remaining -= got;
+    }
+    fclose(out);
+    chmod(outPath.c_str(), 0644);
+    LOGI("[PATCH] wrote %s (%zu bytes)", outPath.c_str(), size - remaining);
+    return true;
+}
+
+static void patch_dump_metadata_and_libil2cpp(const char *outDir) {
+    LOGI("[PATCH] scanning /proc/self/maps for IL2CPP metadata buffer");
+    FILE *mem_f = fopen("/proc/self/mem", "rb");
+    if (!mem_f) { LOGE("[PATCH] cannot open /proc/self/mem"); return; }
+
+    // First pass: scan for metadata magic in r-- regions
+    FILE *maps_f = fopen("/proc/self/maps", "r");
+    bool metadata_dumped = false;
+    if (maps_f) {
+        char line[2048];
+        while (fgets(line, sizeof(line), maps_f) && !metadata_dumped) {
+            unsigned long start = 0, end = 0;
+            char perms[8] = {0};
+            char path_part[1024] = {0};
+            int n = sscanf(line, "%lx-%lx %7s %*s %*s %*s %1023[^\n]",
+                           &start, &end, perms, path_part);
+            if (n < 3) continue;
+            if (perms[0] != 'r') continue;
+            size_t size = end - start;
+            if (size < 1*1024*1024 || size > 50*1024*1024) continue;
+            if (strstr(path_part, "/system/")) continue;
+            if (strstr(path_part, "/apex/")) continue;
+            if (strstr(path_part, ".so")) continue;
+            if (strstr(path_part, ".apk")) continue;
+            if (strstr(path_part, ".dex")) continue;
+            if (strstr(path_part, ".odex")) continue;
+            if (strstr(path_part, ".oat")) continue;
+            if (strstr(path_part, ".art")) continue;
+            if (strstr(path_part, "[stack")) continue;
+            if (strstr(path_part, "[vdso")) continue;
+            if (strstr(path_part, "[vvar")) continue;
+            if (strstr(path_part, "linker_alloc")) continue;
+
+            uint32_t magic = 0;
+            if (!patch_read_proc_mem(mem_f, start, &magic, 4)) continue;
+            if (magic != 0xFAB11BAFu) continue;
+
+            LOGI("[PATCH] METADATA FOUND at 0x%lx size=%zu path=[%s]",
+                 start, size, path_part);
+            std::string outPath = std::string(outDir) + "/files/global-metadata.dat";
+            metadata_dumped = patch_dump_region_via_proc_mem(mem_f, start, size, outPath);
+        }
+        fclose(maps_f);
+    }
+    if (!metadata_dumped) {
+        LOGE("[PATCH] metadata buffer NOT found in memory");
+    }
+
+    // Second pass: dump libil2cpp.so loaded image (concatenate all segments)
+    FILE *maps2 = fopen("/proc/self/maps", "r");
+    unsigned long il2_start = 0, il2_end = 0;
+    if (maps2) {
+        char l2[2048];
+        while (fgets(l2, sizeof(l2), maps2)) {
+            if (!strstr(l2, "libil2cpp.so")) continue;
+            unsigned long s = 0, e = 0;
+            if (sscanf(l2, "%lx-%lx", &s, &e) == 2) {
+                if (il2_start == 0 || s < il2_start) il2_start = s;
+                if (e > il2_end) il2_end = e;
+            }
+        }
+        fclose(maps2);
+    }
+    if (il2_start != 0 && il2_end > il2_start) {
+        size_t il2_size = il2_end - il2_start;
+        std::string outPath = std::string(outDir) + "/files/libil2cpp.so";
+        patch_dump_region_via_proc_mem(mem_f, il2_start, il2_size, outPath);
+    }
+
+    fclose(mem_f);
+}
+// ===== END PATCH =====
 
 void init_il2cpp_api(void *handle) {
 #define DO_API(r, n, p) {                      \
@@ -345,6 +448,10 @@ void il2cpp_api_init(void *handle) {
 
 void il2cpp_dump(const char *outDir) {
     LOGI("dumping...");
+    // PATCH: dump raw metadata + in-memory libil2cpp.so BEFORE iterating
+    // classes, while the decrypted buffer is still alive.
+    patch_dump_metadata_and_libil2cpp(outDir);
+
     size_t size;
     auto domain = il2cpp_domain_get();
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
