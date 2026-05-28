@@ -30,35 +30,30 @@
 static uint64_t il2cpp_base = 0;
 
 // ===== PATCH: dump raw decrypted global-metadata.dat + in-memory libil2cpp.so =====
-static bool patch_read_proc_mem(FILE *mem, uint64_t addr, void *buf, size_t len) {
-    if (fseeko(mem, (off_t)addr, SEEK_SET) != 0) return false;
-    return fread(buf, 1, len, mem) == len;
-}
+// We are inside the game process so direct memory dereference works as long as
+// the region is actually mapped readable. /proc/self/maps tells us that.
+// (Note: /proc/self/mem is blocked by SELinux on app processes, so we cannot use it.)
 
-static bool patch_dump_region_via_proc_mem(FILE *mem_f, uint64_t start, size_t size,
-                                            const std::string &outPath) {
+static bool patch_dump_region_direct(uint64_t start, size_t size, const std::string &outPath) {
     FILE *out = fopen(outPath.c_str(), "wb");
     if (!out) { LOGE("[PATCH] cannot open output %s", outPath.c_str()); return false; }
-    char buf[65536];
-    size_t remaining = size;
-    if (fseeko(mem_f, (off_t)start, SEEK_SET) != 0) { fclose(out); return false; }
-    while (remaining > 0) {
-        size_t to_read = remaining > sizeof(buf) ? sizeof(buf) : remaining;
-        size_t got = fread(buf, 1, to_read, mem_f);
-        if (got == 0) break;
-        fwrite(buf, 1, got, out);
-        remaining -= got;
+    const size_t CHUNK = 65536;
+    const char *src = reinterpret_cast<const char *>(start);
+    size_t written = 0;
+    while (written < size) {
+        size_t to_write = (size - written) > CHUNK ? CHUNK : (size - written);
+        size_t w = fwrite(src + written, 1, to_write, out);
+        if (w == 0) break;
+        written += w;
     }
     fclose(out);
     chmod(outPath.c_str(), 0644);
-    LOGI("[PATCH] wrote %s (%zu bytes)", outPath.c_str(), size - remaining);
-    return true;
+    LOGI("[PATCH] wrote %s (%zu of %zu bytes)", outPath.c_str(), written, size);
+    return written == size;
 }
 
 static void patch_dump_metadata_and_libil2cpp(const char *outDir) {
     LOGI("[PATCH] scanning /proc/self/maps for IL2CPP metadata buffer");
-    FILE *mem_f = fopen("/proc/self/mem", "rb");
-    if (!mem_f) { LOGE("[PATCH] cannot open /proc/self/mem"); return; }
 
     // First pass: scan for metadata magic in r-- regions
     FILE *maps_f = fopen("/proc/self/maps", "r");
@@ -88,14 +83,14 @@ static void patch_dump_metadata_and_libil2cpp(const char *outDir) {
             if (strstr(path_part, "[vvar")) continue;
             if (strstr(path_part, "linker_alloc")) continue;
 
-            uint32_t magic = 0;
-            if (!patch_read_proc_mem(mem_f, start, &magic, 4)) continue;
+            // Direct dereference — region is mapped r-- so should be safe.
+            uint32_t magic = *reinterpret_cast<const uint32_t *>(start);
             if (magic != 0xFAB11BAFu) continue;
 
             LOGI("[PATCH] METADATA FOUND at 0x%lx size=%zu path=[%s]",
                  start, size, path_part);
             std::string outPath = std::string(outDir) + "/files/global-metadata.dat";
-            metadata_dumped = patch_dump_region_via_proc_mem(mem_f, start, size, outPath);
+            metadata_dumped = patch_dump_region_direct(start, size, outPath);
         }
         fclose(maps_f);
     }
@@ -121,10 +116,8 @@ static void patch_dump_metadata_and_libil2cpp(const char *outDir) {
     if (il2_start != 0 && il2_end > il2_start) {
         size_t il2_size = il2_end - il2_start;
         std::string outPath = std::string(outDir) + "/files/libil2cpp.so";
-        patch_dump_region_via_proc_mem(mem_f, il2_start, il2_size, outPath);
+        patch_dump_region_direct(il2_start, il2_size, outPath);
     }
-
-    fclose(mem_f);
 }
 // ===== END PATCH =====
 
