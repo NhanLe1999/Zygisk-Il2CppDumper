@@ -56,11 +56,18 @@ static void patch_dump_metadata_and_libil2cpp(const char *outDir) {
     LOGI("[PATCH] scanning /proc/self/maps for IL2CPP metadata buffer");
     const uint32_t MAGIC = 0xFAB11BAFu;
 
-    // First pass: ANY readable region of any reasonable size — scan first 64KB
-    // for the magic at any 4-byte aligned offset.
+    // SAFETY: only scan regions we know are safe to dereference:
+    //   - anonymous (empty path)
+    //   - [heap]
+    //   - [anon:*]
+    //   - /memfd:* (in-memory file)
+    //   - /dev/ashmem/* (legacy Android shared memory)
+    // File-backed regions (.so/.apk/.dex/etc.) are SKIPPED — they can SIGBUS
+    // if read past end-of-file via Houdini translation.
     FILE *maps_f = fopen("/proc/self/maps", "r");
     bool metadata_dumped = false;
     int regions_checked = 0;
+    int regions_seen = 0;
     if (maps_f) {
         char line[2048];
         while (fgets(line, sizeof(line), maps_f) && !metadata_dumped) {
@@ -70,17 +77,20 @@ static void patch_dump_metadata_and_libil2cpp(const char *outDir) {
             int n = sscanf(line, "%lx-%lx %7s %*s %*s %*s %1023[^\n]",
                            &start, &end, perms, path_part);
             if (n < 3) continue;
+            regions_seen++;
             if (perms[0] != 'r') continue;
             size_t size = end - start;
-            // metadata file is ~9.8MB. Allow 64KB-100MB range.
             if (size < 64 * 1024 || size > 100 * 1024 * 1024) continue;
-            // Skip only the most obviously wrong paths.
-            if (strstr(path_part, "/system/fonts")) continue;
-            if (strstr(path_part, "[vdso")) continue;
-            if (strstr(path_part, "[vvar")) continue;
-            if (strstr(path_part, "[stack")) continue;
 
-            // Search first 64KB of region for magic at any 4-byte aligned offset.
+            // WHITELIST only known-safe region types
+            bool is_anon       = (path_part[0] == '\0');
+            bool is_heap       = (strcmp(path_part, "[heap]") == 0);
+            bool is_anon_label = (strncmp(path_part, "[anon:", 6) == 0);
+            bool is_memfd      = (strncmp(path_part, "/memfd:", 7) == 0);
+            bool is_ashmem     = (strncmp(path_part, "/dev/ashmem/", 12) == 0);
+            if (!is_anon && !is_heap && !is_anon_label && !is_memfd && !is_ashmem) continue;
+
+            // Scan first 64KB for magic at any 4-byte aligned offset.
             const uint32_t *p = reinterpret_cast<const uint32_t *>(start);
             size_t scan_words = (size < 65536 ? size : 65536) / 4;
             size_t found_offset = (size_t)-1;
@@ -99,7 +109,7 @@ static void patch_dump_metadata_and_libil2cpp(const char *outDir) {
         }
         fclose(maps_f);
     }
-    LOGI("[PATCH] scanned %d candidate regions", regions_checked);
+    LOGI("[PATCH] saw %d total regions, scanned %d candidate regions", regions_seen, regions_checked);
     if (!metadata_dumped) {
         LOGE("[PATCH] metadata buffer NOT found in memory");
     }
