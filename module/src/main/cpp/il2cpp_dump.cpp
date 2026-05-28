@@ -54,10 +54,13 @@ static bool patch_dump_region_direct(uint64_t start, size_t size, const std::str
 
 static void patch_dump_metadata_and_libil2cpp(const char *outDir) {
     LOGI("[PATCH] scanning /proc/self/maps for IL2CPP metadata buffer");
+    const uint32_t MAGIC = 0xFAB11BAFu;
 
-    // First pass: scan for metadata magic in r-- regions
+    // First pass: ANY readable region of any reasonable size — scan first 64KB
+    // for the magic at any 4-byte aligned offset.
     FILE *maps_f = fopen("/proc/self/maps", "r");
     bool metadata_dumped = false;
+    int regions_checked = 0;
     if (maps_f) {
         char line[2048];
         while (fgets(line, sizeof(line), maps_f) && !metadata_dumped) {
@@ -69,36 +72,41 @@ static void patch_dump_metadata_and_libil2cpp(const char *outDir) {
             if (n < 3) continue;
             if (perms[0] != 'r') continue;
             size_t size = end - start;
-            if (size < 1*1024*1024 || size > 50*1024*1024) continue;
-            if (strstr(path_part, "/system/")) continue;
-            if (strstr(path_part, "/apex/")) continue;
-            if (strstr(path_part, ".so")) continue;
-            if (strstr(path_part, ".apk")) continue;
-            if (strstr(path_part, ".dex")) continue;
-            if (strstr(path_part, ".odex")) continue;
-            if (strstr(path_part, ".oat")) continue;
-            if (strstr(path_part, ".art")) continue;
-            if (strstr(path_part, "[stack")) continue;
+            // metadata file is ~9.8MB. Allow 64KB-100MB range.
+            if (size < 64 * 1024 || size > 100 * 1024 * 1024) continue;
+            // Skip only the most obviously wrong paths.
+            if (strstr(path_part, "/system/fonts")) continue;
             if (strstr(path_part, "[vdso")) continue;
             if (strstr(path_part, "[vvar")) continue;
-            if (strstr(path_part, "linker_alloc")) continue;
+            if (strstr(path_part, "[stack")) continue;
 
-            // Direct dereference — region is mapped r-- so should be safe.
-            uint32_t magic = *reinterpret_cast<const uint32_t *>(start);
-            if (magic != 0xFAB11BAFu) continue;
+            // Search first 64KB of region for magic at any 4-byte aligned offset.
+            const uint32_t *p = reinterpret_cast<const uint32_t *>(start);
+            size_t scan_words = (size < 65536 ? size : 65536) / 4;
+            size_t found_offset = (size_t)-1;
+            for (size_t i = 0; i < scan_words; ++i) {
+                if (p[i] == MAGIC) { found_offset = i * 4; break; }
+            }
+            regions_checked++;
+            if (found_offset == (size_t)-1) continue;
 
-            LOGI("[PATCH] METADATA FOUND at 0x%lx size=%zu path=[%s]",
-                 start, size, path_part);
+            unsigned long magic_addr = start + found_offset;
+            size_t dump_size = size - found_offset;
+            LOGI("[PATCH] METADATA FOUND at 0x%lx (region 0x%lx-0x%lx, offset 0x%zx, dump_size=%zu) path=[%s]",
+                 magic_addr, start, end, found_offset, dump_size, path_part);
             std::string outPath = std::string(outDir) + "/files/global-metadata.dat";
-            metadata_dumped = patch_dump_region_direct(start, size, outPath);
+            metadata_dumped = patch_dump_region_direct(magic_addr, dump_size, outPath);
         }
         fclose(maps_f);
     }
+    LOGI("[PATCH] scanned %d candidate regions", regions_checked);
     if (!metadata_dumped) {
         LOGE("[PATCH] metadata buffer NOT found in memory");
     }
 
-    // Second pass: dump libil2cpp.so loaded image (concatenate all segments)
+    // Second pass: dump libil2cpp.so loaded image — find FIRST contiguous group
+    // of libil2cpp.so segments (game may have multiple loads, e.g. ARM via Houdini
+    // + native x86 stub; we want the contiguous ARM image only).
     FILE *maps2 = fopen("/proc/self/maps", "r");
     unsigned long il2_start = 0, il2_end = 0;
     if (maps2) {
@@ -106,15 +114,21 @@ static void patch_dump_metadata_and_libil2cpp(const char *outDir) {
         while (fgets(l2, sizeof(l2), maps2)) {
             if (!strstr(l2, "libil2cpp.so")) continue;
             unsigned long s = 0, e = 0;
-            if (sscanf(l2, "%lx-%lx", &s, &e) == 2) {
-                if (il2_start == 0 || s < il2_start) il2_start = s;
-                if (e > il2_end) il2_end = e;
+            if (sscanf(l2, "%lx-%lx", &s, &e) != 2) continue;
+            if (il2_start == 0) {
+                il2_start = s; il2_end = e;
+                continue;
             }
+            // Only extend if contiguous (gap < 16MB) — stop if jumps to different image
+            if (s > il2_end + 16 * 1024 * 1024) break;
+            if (e > il2_end) il2_end = e;
         }
         fclose(maps2);
     }
     if (il2_start != 0 && il2_end > il2_start) {
         size_t il2_size = il2_end - il2_start;
+        LOGI("[PATCH] libil2cpp.so image at 0x%lx-0x%lx size=%zu",
+             il2_start, il2_end, il2_size);
         std::string outPath = std::string(outDir) + "/files/libil2cpp.so";
         patch_dump_region_direct(il2_start, il2_size, outPath);
     }
